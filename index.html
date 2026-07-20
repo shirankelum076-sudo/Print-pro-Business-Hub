@@ -710,12 +710,29 @@ async function pushToSheets(manual){
 }
 
 /* ---------- persistence ---------- */
+const LOCAL_STATE_KEY = 'business-hub-state-v1';
+function localSaveState(){
+  try{ localStorage.setItem(LOCAL_STATE_KEY, JSON.stringify(state)); return true; }
+  catch(e){ console.error('localStorage save failed:', e); return false; }
+}
+function localLoadState(){
+  try{
+    const raw = localStorage.getItem(LOCAL_STATE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  }catch(e){ console.error('localStorage load failed:', e); return null; }
+}
+
 async function loadState(){
+  let loadedFromClaudeStorage = false;
   if(window.storage){
     try{
       const res = await window.storage.get('business-hub-state');
-      if(res && res.value) state = JSON.parse(res.value);
+      if(res && res.value){ state = JSON.parse(res.value); loadedFromClaudeStorage = true; }
     }catch(e){ /* first run, or key doesn't exist yet */ }
+  }
+  if(!loadedFromClaudeStorage){
+    const local = localLoadState();
+    if(local) state = local;
   }
   if(!state.materials) state.materials = [];
   populateBizFields();
@@ -740,14 +757,16 @@ function renderCustomerNames(){
   dl.innerHTML = names.map(n=>`<option value="${esc(n)}">`).join('');
 }
 async function saveState(skipPush){
+  localSaveState();
   if(window.storage){
     try{
       const ok = await window.storage.set('business-hub-state', JSON.stringify(state));
-      if(!ok) console.error('Local cache save failed: storage returned no result.');
-    }catch(e){ console.error('Local cache save failed:', e); }
+      if(!ok) console.error('Claude storage save failed: storage returned no result.');
+    }catch(e){ console.error('Claude storage save failed:', e); }
   }
   if(!skipPush && getSheetsUrl()){ pushToSheets(false); }
 }
+
 
 /* ---------- backup / restore ---------- */
 function downloadBlob(filename, content, mime){
