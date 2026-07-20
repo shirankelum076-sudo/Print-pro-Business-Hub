@@ -68,7 +68,7 @@
   .btn.danger{ color:var(--red); border-color:var(--red); background:transparent; }
 
   .item-card{ background:var(--panel-raised); border:1px solid var(--line); border-radius:8px; padding:12px; margin-bottom:10px; }
-  .item-card .item-grid{ display:grid; grid-template-columns:1.6fr 1fr 1fr 0.7fr 1fr; gap:8px; margin-bottom:8px; }
+  .item-card .item-grid{ display:grid; grid-template-columns:1.5fr 1fr 1fr 0.7fr 0.8fr 1fr; gap:8px; margin-bottom:8px; }
   @media(max-width:640px){ .item-card .item-grid{grid-template-columns:1fr 1fr;} }
   .item-card input, .item-card select{ background:var(--panel); border:1px solid var(--line); color:var(--ink); padding:8px 10px; border-radius:6px; font-size:13px; width:100%; font-family:'Inter',sans-serif; }
   .item-card select:focus, .item-card input:focus{ border-color:var(--hot); outline:none; }
@@ -650,7 +650,13 @@ let editingOrderId = null;
 
 function uid(){ return Date.now().toString(36) + Math.random().toString(36).slice(2,6); }
 function fmt(n){ return 'Rs ' + Math.round(n||0).toLocaleString('en-US'); }
-function todayISO(){ return new Date().toISOString().slice(0,10); }
+function todayISO(){
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth()+1).padStart(2,'0');
+  const dd = String(d.getDate()).padStart(2,'0');
+  return `${yyyy}-${mm}-${dd}`;
+}
 
 /* ---------- Google Sheets sync ---------- */
 const SHEETS_URL_KEY = 'ghubSheetsUrl';
@@ -983,7 +989,7 @@ let discountEnabled = false;
 function addItemRow(){
   const firstMat = getMaterialNames()[0];
   const firstCol = getColoursForMaterial(firstMat)[0];
-  newItems.push({ id: uid(), desc:'', material:firstMat, materialCustom:'', colour:firstCol, colourCustom:'', qty:1, price:0 });
+  newItems.push({ id: uid(), desc:'', material:firstMat, materialCustom:'', colour:firstCol, colourCustom:'', qty:1, price:0, weight:0 });
   renderItemRows();
 }
 function removeItemRow(id){
@@ -1064,7 +1070,7 @@ function addCalcResultToQuote(prefix){
     id: uid(),
     desc: `${info.material || 'Print'} job — ${weight}g, ${hours}h`,
     material, materialCustom: '', colour, colourCustom: '',
-    qty: 1, price: Math.round(sellingPrice),
+    qty: 1, price: Math.round(sellingPrice), weight: weight || 0,
   });
   renderItemRows();
   return true;
@@ -1152,6 +1158,7 @@ function renderItemRows(){
         <div><div class="field-hint">Material</div><select class="f-material">${optionsHTML(getMaterialNames(), i.material)}</select></div>
         <div><div class="field-hint">Colour</div><div class="colour-field"><span class="colour-swatch" id="swatch-${i.id}" style="${swatchStyle(i.colour, i.colourCustom)}"></span><select class="f-colour">${optionsHTML(getColoursForMaterial(i.material), i.colour)}</select></div></div>
         <div><div class="field-hint">Qty</div><input type="number" class="f-qty" placeholder="1" value="${i.qty}"></div>
+        <div><div class="field-hint" title="5% extra is added automatically for waste/failed prints, then deducted from Inventory">Weight (g) +5%</div><input type="number" class="f-weight" placeholder="0" value="${i.weight||0}" min="0"></div>
         <div><div class="field-hint">Unit price</div><input type="number" class="f-price" placeholder="0" value="${i.price}"></div>
       </div>
       <div class="f-material-other-wrap" style="display:${i.material==='Other'?'block':'none'}; margin-bottom:8px;">
@@ -1207,6 +1214,7 @@ document.getElementById('itemRows').addEventListener('input', function(e){
     if(swatch) swatch.style.cssText = swatchStyle(item.colour, item.colourCustom);
   }
   else if(e.target.classList.contains('f-qty')) item.qty = parseFloat(e.target.value)||0;
+  else if(e.target.classList.contains('f-weight')) item.weight = parseFloat(e.target.value)||0;
   else if(e.target.classList.contains('f-price')) item.price = parseFloat(e.target.value)||0;
   else return;
 
@@ -1316,6 +1324,7 @@ function createQuote(){
   if(editingOrderId){
     const o = state.orders.find(o=>o.id===editingOrderId);
     if(!o){ alert('That order no longer exists.'); resetQuoteForm(); return; }
+    restockInventoryForItems(o.items); // undo the old weight deduction before applying the new one
     o.customerName = name;
     o.customerPhone = document.getElementById('cPhone').value;
     o.customerAddress = document.getElementById('cAddress').value;
@@ -1324,9 +1333,11 @@ function createQuote(){
     o.validDays = document.getElementById('validDays').value || 7;
     o.deliveryDate = document.getElementById('deliveryDate').value;
     o.terms = document.getElementById('terms').value;
+    deductInventoryForItems(o.items);
+    o.weight = Math.round(orderTotalWeight(o));
     saveState();
     resetQuoteForm();
-    showTab('orders'); renderOrders(); renderDashboard(); renderCustomerNames();
+    showTab('orders'); renderOrders(); renderDashboard(); renderCustomerNames(); renderInventory();
     showStockWarning(checkStockForOrder(o));
     return;
   }
@@ -1346,10 +1357,12 @@ function createQuote(){
     createdAt: todayISO(),
     weight: '',
   };
+  deductInventoryForItems(order.items);
+  order.weight = Math.round(orderTotalWeight(order));
   state.orders.unshift(order);
   saveState();
   resetQuoteForm();
-  showTab('orders'); renderOrders(); renderDashboard(); renderCustomerNames();
+  showTab('orders'); renderOrders(); renderDashboard(); renderCustomerNames(); renderInventory();
   showStockWarning(checkStockForOrder(order));
 }
 
@@ -1367,6 +1380,34 @@ function findInventoryMatch(material, colour){
     (m.colour||'').trim().toLowerCase() === (colour||'').toLowerCase()
   ) || null;
 }
+
+/* ---------- weight-based inventory deduction ---------- */
+const WASTE_BUFFER_MULTIPLIER = 1.05; // +5% extra material per part, to account for failed prints/purging
+function itemTotalWeight(item){
+  const perPart = parseFloat(item.weight) || 0;
+  const qty = parseFloat(item.qty) || 0;
+  if(perPart <= 0 || qty <= 0) return 0;
+  return perPart * qty * WASTE_BUFFER_MULTIPLIER;
+}
+function orderTotalWeight(order){
+  return (order.items||[]).reduce((sum, i) => sum + itemTotalWeight(i), 0);
+}
+// sign: -1 to deduct from stock (new/edited order), +1 to give back (order deleted, or old items reverted before an edit)
+function applyInventoryWeightDelta_(items, sign){
+  (items||[]).forEach(item => {
+    const grams = itemTotalWeight(item);
+    if(grams <= 0) return;
+    const { material, colour } = resolveItemMaterial(item);
+    if(!material) return;
+    const match = findInventoryMatch(material, colour);
+    if(!match) return; // not a tracked inventory material — nothing to adjust
+    const current = Number(match.stockGrams) || 0;
+    match.stockGrams = Math.max(0, Math.round(current + sign * grams));
+  });
+}
+function deductInventoryForItems(items){ applyInventoryWeightDelta_(items, -1); }
+function restockInventoryForItems(items){ applyInventoryWeightDelta_(items, 1); }
+
 function checkStockForOrder(order){
   const warnings = [];
   const seen = new Set();
@@ -1466,9 +1507,10 @@ function deleteOrder(id){
   const o = state.orders.find(o=>o.id===id);
   if(!o) return;
   if(!confirm(`Delete order for ${o.customerName} (${o.invoiceNo})? This can't be undone.`)) return;
+  restockInventoryForItems(o.items); // give back the material weight this order had deducted
   state.orders = state.orders.filter(o=>o.id!==id);
   saveState();
-  renderOrders(); renderDashboard(); renderCustomerNames();
+  renderOrders(); renderDashboard(); renderCustomerNames(); renderInventory();
 }
 
 /* ---------- orders list ---------- */
@@ -1643,9 +1685,10 @@ function formatDateLong(value){
   return d.toLocaleDateString('en-GB', { day:'numeric', month:'long', year:'numeric' });
 }
 function computeValidUntil(order){
-  const base = order.createdAt ? new Date(order.createdAt + 'T00:00:00') : new Date();
+  let base = order.createdAt ? new Date(order.createdAt + 'T00:00:00') : new Date();
+  if(isNaN(base.getTime())) base = new Date(); // fall back rather than silently returning a blank date
   const days = parseInt(order.validDays, 10) || 7;
-  if(!isNaN(base.getTime())) base.setDate(base.getDate() + days);
+  base.setDate(base.getDate() + days);
   return base;
 }
 function splitAddressForLabel(addr){
@@ -1936,7 +1979,7 @@ function docLabel(o){
   const servicesRaw = b.services || '3D Printing, 3D Modeling, Mold Making';
   const services = servicesRaw.split(',').map(s => s.trim()).filter(Boolean);
   const dispatchDate = o.deliveryDate ? formatDateLong(o.deliveryDate) : formatDateLong(new Date());
-  const weight = o.weight ? `${o.weight} kg` : '—';
+  const weight = o.weight ? `${(o.weight/1000).toFixed(2)} kg` : '—';
 
   const field = (label, value) => `<div class="lbl-field"><span>${esc(label)}</span><strong>${esc(value) || '—'}</strong></div>`;
   const metaItem = (label, value, accent) => `<div><span>${esc(label)}</span><strong${accent ? ' class="accent"' : ''}>${esc(value) || '—'}</strong></div>`;
@@ -2110,20 +2153,26 @@ async function downloadDocPDF(){
   // otherwise text can render in a fallback font, throwing off spacing and sharpness.
   try{ if(document.fonts && document.fonts.ready) await document.fonts.ready; }catch(e){ /* proceed anyway */ }
 
-  const targetWidth = el.scrollWidth;
+  // Size the PDF page to match the document's own proportions, instead of always
+  // using a full A4 sheet (which left most short documents mostly blank).
+  const marginMm = 8;
+  const pageWidthMm = 210;
+  const contentWidthMm = pageWidthMm - marginMm * 2;
+  const aspect = el.scrollHeight / el.scrollWidth;
+  const pageHeightMm = Math.max(120, contentWidthMm * aspect + marginMm * 2);
 
   html2pdf().set({
-    margin: 8,
+    margin: marginMm,
     filename: filename,
     image: { type: 'png' }, // lossless — avoids JPEG artifacts on text and sharp table borders
     html2canvas: {
       scale: 3,             // higher DPI so text and lines stay crisp, not blurry
       useCORS: true,
       backgroundColor: '#ffffff',
-      windowWidth: targetWidth,
-      width: targetWidth,
+      // NOTE: don't override width/windowWidth here without also matching height —
+      // doing so previously stretched the page unevenly (e.g. turned the round logo into an oval).
     },
-    jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' },
+    jsPDF: { unit: 'mm', format: [pageWidthMm, pageHeightMm], orientation: 'portrait' },
     pagebreak: { mode: ['avoid-all', 'css', 'legacy'] }, // don't slice a table row or box across two pages
   }).from(el).save().then(() => {
     btn.textContent = originalText; btn.disabled = false;
