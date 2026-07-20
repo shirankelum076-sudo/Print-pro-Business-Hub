@@ -681,11 +681,20 @@ async function pullFromSheets(manual){
     const res = await fetch(url, { method: 'GET' });
     const json = await res.json();
     if(!json.ok) throw new Error(json.error || 'Unknown error from script');
+    const incomingBusiness = json.data.business && typeof json.data.business === 'object' ? json.data.business : {};
+    // Merge rather than replace: an empty/incomplete Business tab on the Sheet
+    // should never wipe out business info you've already saved locally.
+    const mergedBusiness = { ...state.business };
+    Object.keys(incomingBusiness).forEach(k => {
+      if(incomingBusiness[k] !== '' && incomingBusiness[k] !== null && incomingBusiness[k] !== undefined){
+        mergedBusiness[k] = incomingBusiness[k];
+      }
+    });
     state = {
       orders: Array.isArray(json.data.orders) ? json.data.orders : [],
       expenses: Array.isArray(json.data.expenses) ? json.data.expenses : [],
       materials: Array.isArray(json.data.materials) ? json.data.materials : [],
-      business: json.data.business && typeof json.data.business==='object' ? json.data.business : {},
+      business: mergedBusiness,
     };
     await saveState(true); // refresh local cache without re-pushing
     populateBizFields();
@@ -2085,7 +2094,7 @@ function openDoc(type, orderId){
     }
   }
 }
-function downloadDocPDF(){
+async function downloadDocPDF(){
   const el = document.getElementById('printArea');
   const btn = document.getElementById('downloadPdfBtn');
   if(typeof html2pdf === 'undefined'){
@@ -2096,12 +2105,26 @@ function downloadDocPDF(){
   const filename = rawTitle.replace(/[^\w\- ]+/g, '').trim().replace(/\s+/g, '_') + '.pdf';
   const originalText = btn.textContent;
   btn.textContent = 'Generating…'; btn.disabled = true;
+
+  // Make sure custom fonts have actually loaded before rasterizing —
+  // otherwise text can render in a fallback font, throwing off spacing and sharpness.
+  try{ if(document.fonts && document.fonts.ready) await document.fonts.ready; }catch(e){ /* proceed anyway */ }
+
+  const targetWidth = el.scrollWidth;
+
   html2pdf().set({
     margin: 8,
     filename: filename,
-    image: { type: 'jpeg', quality: 0.98 },
-    html2canvas: { scale: 2, useCORS: true, backgroundColor: '#ffffff' },
+    image: { type: 'png' }, // lossless — avoids JPEG artifacts on text and sharp table borders
+    html2canvas: {
+      scale: 3,             // higher DPI so text and lines stay crisp, not blurry
+      useCORS: true,
+      backgroundColor: '#ffffff',
+      windowWidth: targetWidth,
+      width: targetWidth,
+    },
     jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' },
+    pagebreak: { mode: ['avoid-all', 'css', 'legacy'] }, // don't slice a table row or box across two pages
   }).from(el).save().then(() => {
     btn.textContent = originalText; btn.disabled = false;
   }).catch((err) => {
